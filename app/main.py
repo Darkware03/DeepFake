@@ -1,118 +1,255 @@
 import os
 import sys
+import shutil
+import cv2
+import numpy as np
+import torch
+from torchvision import transforms
 
-# =====================================================================
-# SECCIÓN CRÍTICA: Configuración preventiva de rutas de Python
-# Debe ejecutarse antes de importar cualquier módulo local o de terceros
-# =====================================================================
+# ==========================================================
+# PYTHON PATH
+# ==========================================================
 RAIZ_WORKSPACE = "/workspace"
+
 if RAIZ_WORKSPACE not in sys.path:
     sys.path.insert(0, RAIZ_WORKSPACE)
 
-# También añadimos la ruta relativa hacia el directorio superior por seguridad
-ruta_padre = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if ruta_padre not in sys.path:
-    sys.path.insert(0, ruta_padre)
-# =====================================================================
-
-import torch
+# ==========================================================
+# FASTAPI
+# ==========================================================
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import shutil
 
-# Importaciones del benchmark (Ahora resueltas correctamente)
-from networks.xception import Xception
-from preprocessing.utils import extract_frames # Ajusta según las funciones de preprocesamiento de tu pipeline
+# ==========================================================
+# DEEPFAKEBENCH
+# ==========================================================
+from training.networks.xception import Xception
 
+# ==========================================================
+# APP
+# ==========================================================
 app = FastAPI(
-    title="Deepfake Detection Benchmark API",
-    description="API forense para la detección de anomalías y manipulaciones faciales en video e imágenes.",
+    title="DeepFake Detection API",
+    description="API basada en DeepFakeBench - Inferencia real con Xception",
     version="1.0.0"
 )
 
-# Configuración de rutas internas de los pesos mapeados por el volumen
-PATH_PESOS = "/workspace/weights/xception_best.pth" # Ajusta al nombre exacto de tu archivo .pth
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ==========================================================
+# CONFIG
+# ==========================================================
+PATH_PESOS = "/workspace/weights/xception.pth"
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
 
 model = None
+preprocess_transform = None
 
+# ==========================================================
+# STARTUP
+# ==========================================================
 @app.on_event("startup")
 async def load_model():
-    """
-    Inicializa el modelo de detección al arrancar el contenedor.
-    Garantiza que los pesos estén disponibles en el volumen montado.
-    """
-    global model
+    global model, preprocess_transform
+
+    print("=" * 80)
+    print(f"[*] DEVICE: {DEVICE}")
+    print(f"[*] PESOS: {PATH_PESOS}")
+    print("=" * 80)
+
     if not os.path.exists(PATH_PESOS):
-        raise RuntimeError(f"Falta el archivo de pesos del modelo en la ruta montada: {PATH_PESOS}")
-    
+        raise RuntimeError(
+            f"No existe el archivo de pesos: {PATH_PESOS}"
+        )
+
     try:
-        # Inicializar la arquitectura Xception del benchmark
-        model = Xception(num_classes=2)
-        
-        # Cargar los pesos guardados en la GPU o CPU según disponibilidad
-        state_dict = torch.load(PATH_PESOS, map_location=DEVICE)
-        model.load_state_dict(state_dict)
+        # Configuración real extraída de xception.yaml
+        xception_config = {
+            "mode": "original",
+            "num_classes": 2,
+            "inc": 3,
+            "dropout": False
+        }
+
+        print("[*] Creando arquitectura Xception...")
+        model = Xception(xception_config)
+
+        print("[*] Cargando checkpoint...")
+        checkpoint = torch.load(PATH_PESOS, map_location=DEVICE)
+
+        # Si el checkpoint fue guardado desde el XceptionDetector, las llaves empiezan con "backbone."
+        # Removemos "backbone." para poder cargarlo directamente en la red Xception.
+        if isinstance(checkpoint, dict):
+            # Extraer state_dict si viene envuelto
+            if "state_dict" in checkpoint:
+                checkpoint = checkpoint["state_dict"]
+            elif "model" in checkpoint:
+                checkpoint = checkpoint["model"]
+            elif "net" in checkpoint:
+                checkpoint = checkpoint["net"]
+
+            # Limpiar "backbone." si existe
+            first_key = list(checkpoint.keys())[0]
+            if first_key.startswith("backbone."):
+                print("[*] Limpiando prefijo 'backbone.' de las llaves del checkpoint...")
+                checkpoint = {k.replace("backbone.", ""): v for k, v in checkpoint.items()}
+
+        print("[*] Aplicando pesos...")
+        missing, unexpected = model.load_state_dict(checkpoint, strict=False)
+
+        print(f"[*] Missing keys: {len(missing)}")
+        print(f"[*] Unexpected keys: {len(unexpected)}")
+        if unexpected:
+            print(f"[*] Unexpected keys sample: {unexpected[:5]}")
+
         model.to(DEVICE)
         model.eval()
-        print(f"[*] Modelo Xception cargado exitosamente en el dispositivo: {DEVICE}")
-    except Exception as e:
-        print(f"[-] Error crítico al inicializar el modelo: {str(e)}")
-        raise e
 
+        print("[*] Inicializando transformaciones de inferencia...")
+        # Transformación idéntica a DeepFakeBench: ToTensor() + Normalize(0.5, 0.5)
+        preprocess_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+
+        print("[+] MODELO CARGADO CORRECTAMENTE")
+
+    except Exception as e:
+        print("=" * 80)
+        print("ERROR CARGANDO MODELO")
+        print(str(e))
+        print("=" * 80)
+        raise
+
+# ==========================================================
+# HEALTH
+# ==========================================================
 @app.get("/health")
-async def health_check():
-    """Endpoint de control para orquestadores o chequeo rápido."""
+async def health():
     return {
-        "status": "healthy",
+        "status": "ok",
         "device": str(DEVICE),
         "model_loaded": model is not None
     }
 
+# ==========================================================
+# DETECT
+# ==========================================================
 @app.post("/api/v1/detect")
-async def detect_manipulation(file: UploadFile = File(...)):
-    """
-    Recibe un archivo multimedia, extrae características faciales
-    y determina la probabilidad de manipulación (Deepfake).
-    """
-    if not model:
-        raise HTTPException(status_code=503, detail="El modelo de inferencia no está listo.")
+async def detect(file: UploadFile = File(...)):
+    if model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Modelo no cargado"
+        )
 
-    # Guardar archivo de forma temporal para procesar
     temp_dir = "/tmp/analisis"
     os.makedirs(temp_dir, exist_ok=True)
-    temp_file_path = os.path.join(temp_dir, file.filename)
+    temp_file = os.path.join(temp_dir, file.filename)
 
     try:
-        with open(temp_file_path, "wb") as buffer:
+        with open(temp_file, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # =================================================================
-        # PIPELINE DE INFERENCIA (Ajusta la lógica a tu preprocesamiento exacto)
-        # =================================================================
-        # Ejemplo hipotético de flujo de inferencia:
-        # frames = extract_frames(temp_file_path)
-        # inputs = transform_frames(frames).to(DEVICE)
-        # with torch.no_grad():
-        #     outputs = model(inputs)
-        #     score = torch.softmax(outputs, dim=1)[:, 1].item()
-        # =================================================================
+        ext = os.path.splitext(file.filename)[1].lower()
+        VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv"}
         
-        # Mock de respuesta temporal estructurada para validar comunicación
-        score_simulado = 0.87 
+        scores = []
         
-        return JSONResponse(status_code=200, content={
-            "filename": file.filename,
-            "deepfake_probability": score_simulado,
-            "is_manipulated": score_simulado > 0.5,
-            "message": "Análisis forense completado con éxito."
-        })
+        if ext in VIDEO_EXTENSIONS:
+            cap = cv2.VideoCapture(temp_file)
+            if not cap.isOpened():
+                raise HTTPException(status_code=400, detail="Video inválido")
+            
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if fps == 0 or np.isnan(fps):
+                fps = 30.0
+            
+            frame_interval = max(int(fps / 2), 1)
+            frame_count = 0
+            
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                    
+                if frame_count % frame_interval == 0:
+                    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    img_resized = cv2.resize(img_rgb, (256, 256), interpolation=cv2.INTER_CUBIC)
+                    from PIL import Image
+                    img_pil = Image.fromarray(img_resized)
+                    img_tensor = preprocess_transform(img_pil).unsqueeze(0).to(DEVICE)
+                    
+                    with torch.no_grad():
+                        out, _ = model(img_tensor)
+                        prob = float(torch.softmax(out, dim=1)[:, 1].item())
+                    scores.append(prob)
+                
+                frame_count += 1
+                
+            cap.release()
+            
+            if len(scores) == 0:
+                raise HTTPException(status_code=400, detail="No se pudieron extraer frames")
+                
+            average_score = float(np.mean(scores))
+            max_score = float(np.max(scores))
+            
+            print(f"Frames analizados: {len(scores)}")
+            print(f"Average score: {average_score}")
+            print(f"Max score: {max_score}")
+            
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "filename": file.filename,
+                    "frames_analyzed": len(scores),
+                    "average_probability": round(average_score, 4),
+                    "max_probability": round(max_score, 4),
+                    "deepfake_probability": round(max_score, 4),
+                    "is_manipulated": max_score >= 0.70
+                }
+            )
+            
+        else:
+            # 1. Leer imagen con OpenCV
+            img = cv2.imread(temp_file)
+            if img is None:
+                raise HTTPException(status_code=400, detail=f"No se pudo leer la imagen: {file.filename}")
 
+            # 2. Transformaciones DeepFakeBench (abstract_dataset.py)
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img_resized = cv2.resize(img_rgb, (256, 256), interpolation=cv2.INTER_CUBIC)
+            
+            # Convertir a PIL
+            from PIL import Image
+            img_pil = Image.fromarray(img_resized)
+            img_tensor = preprocess_transform(img_pil).unsqueeze(0).to(DEVICE)
+
+            # 3. Inferencia Real
+            with torch.no_grad():
+                out, _ = model(img_tensor)
+                prob = float(torch.softmax(out, dim=1)[:, 1].item())
+
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "filename": file.filename,
+                    "deepfake_probability": round(prob, 4),
+                    "is_manipulated": prob > 0.5,
+                    "message": "Inferencia real completada"
+                }
+            )
+
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error durante el procesamiento: {str(e)}")
-    
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
     finally:
-        # Limpieza del archivo temporal
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
