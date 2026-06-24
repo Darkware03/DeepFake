@@ -208,7 +208,7 @@ async def detect(file: UploadFile = File(...)):
                     "average_probability": round(average_score, 4),
                     "max_probability": round(max_score, 4),
                     "deepfake_probability": round(max_score, 4),
-                    "is_manipulated": max_score >= 0.70
+                    "is_manipulated": max_score >= 0.40
                 }
             )
             
@@ -237,7 +237,7 @@ async def detect(file: UploadFile = File(...)):
                 content={
                     "filename": file.filename,
                     "deepfake_probability": round(prob, 4),
-                    "is_manipulated": prob > 0.5,
+                    "is_manipulated": prob > 0.4,
                     "message": "Inferencia real completada"
                 }
             )
