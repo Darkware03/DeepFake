@@ -270,7 +270,7 @@ async def detect(
                 shutil.copyfileobj(normal_image.file, buffer)
             
             challenge_result = validate_light_challenge(ch_path, nm_path)
-            print(f"validate_light_challenge: {validate_light_challenge}")
+            #print(f"validate_light_challenge: {validate_light_challenge}")
 
         ext = os.path.splitext(main_file.filename)[1].lower()
         VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv"}
@@ -326,7 +326,7 @@ async def detect(
                 "average_probability": round(average_score, 4),
                 "max_probability": round(max_score, 4),
                 "deepfake_probability": round(max_score, 4),
-                "is_manipulated": max_score >= 0.43
+                "is_manipulated": max_score >= 0.50
             }
             if challenge_result is not None:
                 content_resp["challenge"] = challenge_result
@@ -359,7 +359,7 @@ async def detect(
             content_resp_img = {
                 "filename": main_file.filename,
                 "deepfake_probability": round(prob, 4),
-                "is_manipulated": prob > 0.43,
+                "is_manipulated": prob > 0.50,
                 "message": "Inferencia real completada"
             }
             if challenge_result is not None:
