@@ -326,7 +326,7 @@ async def detect(
                 "average_probability": round(average_score, 4),
                 "max_probability": round(max_score, 4),
                 "deepfake_probability": round(max_score, 4),
-                "is_manipulated": max_score >= 0.50
+                "is_manipulated": max_score >= 0.70
             }
             if challenge_result is not None:
                 content_resp["challenge"] = challenge_result
@@ -359,7 +359,7 @@ async def detect(
             content_resp_img = {
                 "filename": main_file.filename,
                 "deepfake_probability": round(prob, 4),
-                "is_manipulated": prob > 0.50,
+                "is_manipulated": prob > 0.70,
                 "message": "Inferencia real completada"
             }
             if challenge_result is not None:
