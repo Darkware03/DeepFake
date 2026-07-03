@@ -7,7 +7,7 @@
     <list default="true" id="b54ce632-471b-4c4e-83d7-668e8756c1c0" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/app/liveness_engine.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/liveness_engine.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/test_endpoints.py" beforeDir="false" afterPath="$PROJECT_DIR$/test_endpoints.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />

@@ -13,19 +13,21 @@ FEATURE_SCHEMA_VERSION = "2.0.1"
 
 ENGINE_CONFIG = {
     "weights": {
-        "deepfake": 0.25,
-        "color_match": 0.25,
-        "reflection": 0.15,
-        "texture": 0.10,
-        "psd": 0.10,
-        "symmetry": 0.05,
-        "skin_response": 0.05,
+        # El peso de deepfake se traslada a la evidencia física (suma 1.0 total de features físicos)
+        # DeepFake será un modulador/penalizador sobre el physical score
+        "deepfake": 0.0, 
+        "color_match": 0.35, # Aumentado (era 0.25)
+        "reflection": 0.25,  # Aumentado (era 0.15)
+        "texture": 0.15,     # Aumentado (era 0.10)
+        "psd": 0.05,         # Reducido (era 0.10) - Menos robusto
+        "symmetry": 0.05,    
+        "skin_response": 0.10, # Aumentado (era 0.05)
         "quality": 0.05
     },
     "heuristics": {
-        "psd_normalization_divisor": 100.0,
-        "lbp_normalization_divisor": 255.0,
-        "reflection_normalization_divisor": 15.0, # Delta L esperado razonable para un flash (15 puntos de luminosidad)
+        "psd_normalization_divisor": 100.0, # Empírico (truncando a 1.0). Se mantiene.
+        "lbp_normalization_divisor": 255.0, # Justificado (rango LBP uint8 [0, 255]).
+        "reflection_normalization_divisor": 15.0, # Justificado (Delta L en CIE-LAB en luz controlada).
         "blur_threshold": 50.0,
         "brightness_min": 40.0,
         "brightness_max": 230.0
@@ -198,9 +200,11 @@ class WeightedDecisionEngine(DecisionEngine):
         
         df_score = max(0.0, 1.0 - deepfake_prob)
         
+        # Uso de Mediana (estadística robusta) para descartar ROIs atípicos (outliers)
+        # en lugar de un promedio simple (mean) que se distorsiona con una sola ROI ocluida o sobresaturada.
         def avg_feat(name):
             vals = [v for k, v in features.items() if name in k and isinstance(v, (int, float))]
-            return np.mean(vals) if vals else 0.0
+            return float(np.median(vals)) if vals else 0.0
             
         color_match = avg_feat("expected_color_match")
         reflection = avg_feat("reflection_strength")
@@ -215,7 +219,8 @@ class WeightedDecisionEngine(DecisionEngine):
         quality = features.get("global_quality_score", 1.0)
         
         # Ponderación
-        df_cont = df_score * w["deepfake"]
+        # df_cont ya no se suma linealmente. Xception actúa como señal de riesgo independiente.
+        df_cont = 0.0
         cm_cont = color_match * w["color_match"]
         re_cont = reflection * w["reflection"]
         tx_cont = texture_lbp * w["texture"]
@@ -224,7 +229,14 @@ class WeightedDecisionEngine(DecisionEngine):
         sr_cont = skin_resp * w["skin_response"]
         qu_cont = quality * w["quality"]
         
-        final_score = df_cont + cm_cont + re_cont + tx_cont + ps_cont + sy_cont + sr_cont + qu_cont
+        physical_score = cm_cont + re_cont + tx_cont + ps_cont + sy_cont + sr_cont + qu_cont
+        
+        # Penalización DeepFake: Si el modelo está extremadamente seguro de un deepfake (> 0.7)
+        # castiga severamente la puntuación física, de lo contrario afecta levemente la confianza
+        # de forma proporcional.
+        penalty = min(1.0, deepfake_prob) if deepfake_prob > thresh["deepfake_alert"] else (deepfake_prob * 0.5)
+        final_score = max(0.0, physical_score * (1.0 - penalty))
+        
         is_live = final_score >= thresh["live_score"]
         
         evidence = []
