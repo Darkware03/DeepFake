@@ -170,147 +170,165 @@ async def detect(
     if main_file is None:
         raise HTTPException(status_code=400, detail="Se requiere un archivo de video/imagen")
 
-    temp_dir = "/tmp/analisis"
-    os.makedirs(temp_dir, exist_ok=True)
-    temp_file = os.path.join(temp_dir, main_file.filename)
+    import tempfile
+    import re
+    from pathlib import Path
+    
+    # Validar challenge_color si fue proveído
+    valid_color = "#FFFFFF"
+    if challenge_color is not None:
+        if not re.match(r"^#[0-9A-Fa-f]{6}$", challenge_color):
+            raise HTTPException(status_code=400, detail="Formato de challenge_color inválido. Debe ser HEX (#RRGGBB).")
+        valid_color = challenge_color
 
     challenge_result = None
 
     try:
-        with open(temp_file, "wb") as buffer:
-            shutil.copyfileobj(main_file.file, buffer)
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="analisis_") as temp_dir:
+            # Sanitizar nombres de archivo
+            safe_filename = Path(main_file.filename).name
+            temp_file = os.path.join(temp_dir, safe_filename)
+            with open(temp_file, "wb") as buffer:
+                shutil.copyfileobj(main_file.file, buffer)
 
-        if challenge_image and normal_image:
-            ch_path = os.path.join(temp_dir, "challenge_" + challenge_image.filename)
-            nm_path = os.path.join(temp_dir, "normal_" + normal_image.filename)
-            with open(ch_path, "wb") as buffer:
-                shutil.copyfileobj(challenge_image.file, buffer)
-            with open(nm_path, "wb") as buffer:
-                shutil.copyfileobj(normal_image.file, buffer)
-            
-            challenge_result = validate_light_challenge(ch_path, nm_path, expected_hex_color=challenge_color or "#FFFFFF")
+            if challenge_image and normal_image:
+                ch_safe = Path(challenge_image.filename).name
+                nm_safe = Path(normal_image.filename).name
+                ch_path = os.path.join(temp_dir, "challenge_" + ch_safe)
+                nm_path = os.path.join(temp_dir, "normal_" + nm_safe)
+                with open(ch_path, "wb") as buffer:
+                    shutil.copyfileobj(challenge_image.file, buffer)
+                with open(nm_path, "wb") as buffer:
+                    shutil.copyfileobj(normal_image.file, buffer)
+                
+                challenge_result = validate_light_challenge(ch_path, nm_path, expected_hex_color=valid_color)
 
-        ext = os.path.splitext(main_file.filename)[1].lower()
-        VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv"}
-        
-        scores = []
-        
-        if ext in VIDEO_EXTENSIONS:
-            cap = cv2.VideoCapture(temp_file)
-            if not cap.isOpened():
-                raise HTTPException(status_code=400, detail="Video inválido")
+            ext = os.path.splitext(safe_filename)[1].lower()
+            VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv"}
             
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            if fps == 0 or np.isnan(fps):
-                fps = 30.0
+            scores = []
             
-            frame_interval = max(int(fps / 2), 1)
-            frame_count = 0
-            
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+            if ext in VIDEO_EXTENSIONS:
+                cap = cv2.VideoCapture(temp_file)
+                if not cap.isOpened():
+                    raise HTTPException(status_code=400, detail="Video inválido")
+                
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                if fps == 0 or np.isnan(fps):
+                    fps = 30.0
+                
+                frame_interval = max(int(fps / 2), 1)
+                frame_count = 0
+                
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                        
+                    if frame_count % frame_interval == 0:
+                        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        img_resized = cv2.resize(img_rgb, (256, 256), interpolation=cv2.INTER_CUBIC)
+                        from PIL import Image
+                        img_pil = Image.fromarray(img_resized)
+                        img_tensor = preprocess_transform(img_pil).unsqueeze(0).to(DEVICE)
+                        
+                        with torch.no_grad():
+                            out, _ = model(img_tensor)
+                            prob = float(torch.softmax(out, dim=1)[:, 1].item())
+                        scores.append(prob)
                     
-                if frame_count % frame_interval == 0:
-                    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    img_resized = cv2.resize(img_rgb, (256, 256), interpolation=cv2.INTER_CUBIC)
-                    from PIL import Image
-                    img_pil = Image.fromarray(img_resized)
-                    img_tensor = preprocess_transform(img_pil).unsqueeze(0).to(DEVICE)
+                    frame_count += 1
                     
-                    with torch.no_grad():
-                        out, _ = model(img_tensor)
-                        prob = float(torch.softmax(out, dim=1)[:, 1].item())
-                    scores.append(prob)
+                cap.release()
                 
-                frame_count += 1
+                if len(scores) == 0:
+                    raise HTTPException(status_code=400, detail="No se pudieron extraer frames")
+                    
+                average_score = float(np.mean(scores))
+                max_score = float(np.max(scores))
+                p95_score = float(np.percentile(scores, 95))
                 
-            cap.release()
-            
-            if len(scores) == 0:
-                raise HTTPException(status_code=400, detail="No se pudieron extraer frames")
+                print(f"Frames analizados: {len(scores)}")
+                print(f"Average score: {average_score}")
+                print(f"Max score: {max_score}")
+                print(f"P95 score: {p95_score}")
                 
-            average_score = float(np.mean(scores))
-            max_score = float(np.max(scores))
-            
-            print(f"Frames analizados: {len(scores)}")
-            print(f"Average score: {average_score}")
-            print(f"Max score: {max_score}")
-            
-            content_resp = {
-                "filename": main_file.filename,
-                "frames_analyzed": len(scores),
-                "average_probability": round(average_score, 4),
-                "max_probability": round(max_score, 4),
-                "deepfake_probability": round(max_score, 4),
-                "is_manipulated": max_score >= 0.70
-            }
-            if challenge_result is not None:
-                content_resp["challenge"] = challenge_result
+                content_resp = {
+                    "filename": safe_filename,
+                    "frames_analyzed": len(scores),
+                    "average_probability": round(average_score, 4),
+                    "max_probability": round(max_score, 4),
+                    # NOTA: p95_probability se reporta únicamente como referencia estadística (Temporal Consistency),
+                    # max_probability (max_score) sigue siendo la métrica utilizada obligatoriamente para la decisión.
+                    "p95_probability": round(p95_score, 4),
+                    "deepfake_probability": round(max_score, 4),
+                    "is_manipulated": max_score >= 0.70
+                }
+                if challenge_result is not None:
+                    content_resp["challenge"] = challenge_result
+                    
+                from app.liveness_engine import numpy_to_python
                 
-            from app.liveness_engine import numpy_to_python
-            
-            # Agregamos Liveness Engine
-            liveness_result = decide_liveness(max_score, challenge_result)
-            content_resp["liveness"] = liveness_result
-            
-            # Compatibilidad para los campos sueltos pedidos
-            content_resp["analysis"] = liveness_result.get("analysis", [])
-            content_resp["risk_level"] = liveness_result.get("risk", "LOW")
-            if "recommendations" in liveness_result:
-                content_resp["recommendations"] = liveness_result["recommendations"]
-
-            return JSONResponse(
-                status_code=200,
-                content=numpy_to_python(content_resp)
-            )
-            
-        else:
-            # 1. Leer imagen con OpenCV
-            img = cv2.imread(temp_file)
-            if img is None:
-                raise HTTPException(status_code=400, detail=f"No se pudo leer la imagen: {main_file.filename}")
-
-            # 2. Transformaciones DeepFakeBench (abstract_dataset.py)
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img_resized = cv2.resize(img_rgb, (256, 256), interpolation=cv2.INTER_CUBIC)
-            
-            # Convertir a PIL
-            from PIL import Image
-            img_pil = Image.fromarray(img_resized)
-            img_tensor = preprocess_transform(img_pil).unsqueeze(0).to(DEVICE)
-
-            # 3. Inferencia Real
-            with torch.no_grad():
-                out, _ = model(img_tensor)
-                prob = float(torch.softmax(out, dim=1)[:, 1].item())
-
-            content_resp_img = {
-                "filename": main_file.filename,
-                "deepfake_probability": round(prob, 4),
-                "is_manipulated": prob > 0.70,
-                "message": "Inferencia real completada"
-            }
-            if challenge_result is not None:
-                content_resp_img["challenge"] = challenge_result
+                # Agregamos Liveness Engine usando max_score como dicta la compatibilidad
+                liveness_result = decide_liveness(max_score, challenge_result)
+                content_resp["liveness"] = liveness_result
                 
-            from app.liveness_engine import numpy_to_python
-            
-            # Agregamos Liveness Engine
-            liveness_result = decide_liveness(prob, challenge_result)
-            content_resp_img["liveness"] = liveness_result
-            
-            # Compatibilidad para los campos sueltos pedidos
-            content_resp_img["analysis"] = liveness_result.get("analysis", [])
-            content_resp_img["risk_level"] = liveness_result.get("risk", "LOW")
-            if "recommendations" in liveness_result:
-                content_resp_img["recommendations"] = liveness_result["recommendations"]
+                # Compatibilidad para los campos sueltos pedidos
+                content_resp["analysis"] = liveness_result.get("analysis", [])
+                content_resp["risk_level"] = liveness_result.get("risk", "LOW")
+                if "recommendations" in liveness_result:
+                    content_resp["recommendations"] = liveness_result["recommendations"]
 
-            return JSONResponse(
-                status_code=200,
-                content=numpy_to_python(content_resp_img)
-            )
+                return JSONResponse(
+                    status_code=200,
+                    content=numpy_to_python(content_resp)
+                )
+                
+            else:
+                # 1. Leer imagen con OpenCV
+                img = cv2.imread(temp_file)
+                if img is None:
+                    raise HTTPException(status_code=400, detail=f"No se pudo leer la imagen: {safe_filename}")
+
+                # 2. Transformaciones DeepFakeBench (abstract_dataset.py)
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img_resized = cv2.resize(img_rgb, (256, 256), interpolation=cv2.INTER_CUBIC)
+                
+                # Convertir a PIL
+                from PIL import Image
+                img_pil = Image.fromarray(img_resized)
+                img_tensor = preprocess_transform(img_pil).unsqueeze(0).to(DEVICE)
+
+                # 3. Inferencia Real
+                with torch.no_grad():
+                    out, _ = model(img_tensor)
+                    prob = float(torch.softmax(out, dim=1)[:, 1].item())
+
+                content_resp_img = {
+                    "filename": safe_filename,
+                    "deepfake_probability": round(prob, 4),
+                    "is_manipulated": prob > 0.70,
+                    "message": "Inferencia real completada"
+                }
+                if challenge_result is not None:
+                    content_resp_img["challenge"] = challenge_result
+                    
+                from app.liveness_engine import numpy_to_python
+                
+                # Agregamos Liveness Engine
+                liveness_result = decide_liveness(prob, challenge_result)
+                content_resp_img["liveness"] = liveness_result
+                
+                # Compatibilidad para los campos sueltos pedidos
+                content_resp_img["analysis"] = liveness_result.get("analysis", [])
+                content_resp_img["risk_level"] = liveness_result.get("risk", "LOW")
+                if "recommendations" in liveness_result:
+                    content_resp_img["recommendations"] = liveness_result["recommendations"]
+
+                return JSONResponse(
+                    status_code=200,
+                    content=numpy_to_python(content_resp_img)
+                )
 
     except HTTPException:
         raise
@@ -319,7 +337,3 @@ async def detect(
             status_code=500,
             detail=str(e)
         )
-
-    finally:
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
