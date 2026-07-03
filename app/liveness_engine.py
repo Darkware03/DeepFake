@@ -23,8 +23,20 @@ ENGINE_CONFIG = {
         "quality": 0.05
     },
     "heuristics": {
-        "psd_normalization_divisor": 100.0, # Límite superior empírico de PSD en rostros para normalizar a 0-1
-        "lbp_normalization_divisor": 255.0  # El código LBP máximo es 255
+        "psd_normalization_divisor": 100.0,
+        "lbp_normalization_divisor": 255.0,
+        "reflection_normalization_divisor": 15.0, # Delta L esperado razonable para un flash (15 puntos de luminosidad)
+        "blur_threshold": 50.0,
+        "brightness_min": 40.0,
+        "brightness_max": 230.0
+    },
+    "thresholds": {
+        "live_score": 0.60,
+        "reflection_min": 0.50,
+        "color_match_min": 0.70,
+        "symmetry_min": 0.70,
+        "quality_min": 0.80,
+        "deepfake_alert": 0.60
     }
 }
 
@@ -112,29 +124,24 @@ class TexturePlugin(Plugin):
             return {"valid": False}
         
         gray_n = cv2.cvtColor(img_n, cv2.COLOR_BGR2GRAY)
-        gray_c = cv2.cvtColor(img_c, cv2.COLOR_BGR2GRAY)
         
-        var_n = cv2.Laplacian(gray_n, cv2.CV_64F).var()
-        var_c = cv2.Laplacian(gray_c, cv2.CV_64F).var()
-        
+        # PSD
         f_n = np.fft.fft2(gray_n)
         fshift_n = np.fft.fftshift(f_n)
         mag_n = np.abs(fshift_n)
         h, w = mag_n.shape
         cy, cx = h//2, w//2
         mag_n[cy-5:cy+5, cx-5:cx+5] = 0
-        fft_energy_n = np.sum(mag_n) / (h*w)
-        
         psd_n = np.sum(np.log(mag_n + 1)**2) / (h*w)
+        
+        # LBP
         lbp_n = compute_lbp(gray_n, mask_n)
         
         elapsed = (time.perf_counter() - start) * 1000
         
+        # Eliminadas métricas sin uso real (laplacian_var, fft_energy)
         return {
             "valid": True,
-            "laplacian_var_normal": float(var_n),
-            "laplacian_var_challenge": float(var_c),
-            "fft_energy": float(fft_energy_n),
             "psd": float(psd_n),
             "lbp": float(lbp_n),
             "time_ms": elapsed
@@ -146,7 +153,7 @@ class ColorPlugin(Plugin):
         if img_n is None or img_n.size == 0 or img_c is None or img_c.size == 0:
             return {"valid": False}
             
-        exp_r, exp_g, exp_b = hex_to_rgb(expected_hex or "#000000")
+        exp_r, exp_g, exp_b = hex_to_rgb(expected_hex or "#FFFFFF")
         
         mean_rgb_n = cv2.mean(img_n, mask=mask_n)[:3]
         mean_rgb_c = cv2.mean(img_c, mask=mask_c)[:3]
@@ -156,27 +163,29 @@ class ColorPlugin(Plugin):
         mean_lab_n = cv2.mean(lab_n, mask=mask_n)[:3]
         mean_lab_c = cv2.mean(lab_c, mask=mask_c)[:3]
         
-        # DeltaE 76
         de76 = deltaE_76(mean_lab_n, mean_lab_c)
         
-        delta_r = mean_rgb_c[2] - mean_rgb_n[2]
-        delta_g = mean_rgb_c[1] - mean_rgb_n[1]
-        delta_b = mean_rgb_c[0] - mean_rgb_n[0]
+        # Cosine Similarity para Color Match
+        # Vectores [R, G, B]
+        v_exp = np.array([exp_r, exp_g, exp_b], dtype=np.float64)
+        v_obs = np.array([
+            mean_rgb_c[2] - mean_rgb_n[2],
+            mean_rgb_c[1] - mean_rgb_n[1],
+            mean_rgb_c[0] - mean_rgb_n[0]
+        ], dtype=np.float64)
         
-        max_exp = max(exp_r, exp_g, exp_b, 1)
-        exp_r_norm = exp_r / max_exp
-        exp_g_norm = exp_g / max_exp
-        exp_b_norm = exp_b / max_exp
+        norm_exp = np.linalg.norm(v_exp)
+        norm_obs = np.linalg.norm(v_obs)
         
-        max_delta = max(abs(delta_r), abs(delta_g), abs(delta_b), 1)
-        dr_norm = delta_r / max_delta
-        dg_norm = delta_g / max_delta
-        db_norm = delta_b / max_delta
-        
-        # Heurística de Color Match
-        color_match = max(0, 1.0 - (abs(exp_r_norm - dr_norm) + abs(exp_g_norm - dg_norm) + abs(exp_b_norm - db_norm)) / 3.0)
-        # Heurística de Intensidad de Reflexión: Promedio de deltas absolutos RGB sobre el rango máximo (255*3)
-        reflection_str = min(1.0, (abs(delta_r) + abs(delta_g) + abs(delta_b)) / (255.0 * 3))
+        if norm_exp == 0 or norm_obs == 0:
+            color_match = 0.0
+        else:
+            cosine_sim = np.dot(v_exp, v_obs) / (norm_exp * norm_obs)
+            color_match = max(0.0, float(cosine_sim))
+            
+        # Reflection Strength (Basado en Delta L de LAB normalizado a 15 unidades como ideal)
+        delta_l = abs(mean_lab_c[0] - mean_lab_n[0])
+        reflection_str = min(1.0, float(delta_l) / ENGINE_CONFIG["heuristics"]["reflection_normalization_divisor"])
         
         elapsed = (time.perf_counter() - start) * 1000
         
@@ -185,8 +194,6 @@ class ColorPlugin(Plugin):
             "deltaE76": float(de76),
             "expected_color_match": float(color_match),
             "reflection_strength": float(reflection_str),
-            "delta_rgb": [float(delta_r), float(delta_g), float(delta_b)],
-            "delta_lab": [float(mean_lab_c[0]-mean_lab_n[0]), float(mean_lab_c[1]-mean_lab_n[1]), float(mean_lab_c[2]-mean_lab_n[2])],
             "time_ms": elapsed
         }
 
@@ -195,14 +202,11 @@ class ColorPlugin(Plugin):
 # ==========================================
 class WeightedDecisionEngine(DecisionEngine):
     def decide(self, features, deepfake_prob):
-        """
-        ATENCIÓN: Este motor NO es un modelo de Machine Learning entrenado.
-        Es un sistema basado en heurísticas. Los pesos NO han sido optimizados estadísticamente.
-        """
         start = time.perf_counter()
         
         w = ENGINE_CONFIG["weights"]
         div = ENGINE_CONFIG["heuristics"]
+        thresh = ENGINE_CONFIG["thresholds"]
         
         df_score = max(0.0, 1.0 - deepfake_prob)
         
@@ -212,45 +216,55 @@ class WeightedDecisionEngine(DecisionEngine):
             
         color_match = avg_feat("expected_color_match")
         reflection = avg_feat("reflection_strength")
-        texture_lbp = avg_feat("lbp") / div["lbp_normalization_divisor"]
+        texture_lbp = min(1.0, avg_feat("lbp") / div["lbp_normalization_divisor"])
         psd = min(1.0, avg_feat("psd") / div["psd_normalization_divisor"]) 
         
-        de_l = features.get("left_cheek_deltaE76", 0)
-        de_r = features.get("right_cheek_deltaE76", 0)
-        symmetry = max(0, 1.0 - abs(de_l - de_r) / max(de_l, de_r, 1))
+        de_l = features.get("left_cheek_deltaE76", 0.0)
+        de_r = features.get("right_cheek_deltaE76", 0.0)
+        symmetry = max(0.0, 1.0 - abs(de_l - de_r) / max(de_l, de_r, 1.0))
         
         skin_resp = reflection * color_match
-        
-        # Dinamización de la calidad (Extraído desde main)
         quality = features.get("global_quality_score", 1.0)
         
-        final_score = (
-            (df_score * w["deepfake"]) +
-            (color_match * w["color_match"]) +
-            (reflection * w["reflection"]) +
-            (texture_lbp * w["texture"]) +
-            (psd * w["psd"]) +
-            (symmetry * w["symmetry"]) +
-            (skin_resp * w["skin_response"]) +
-            (quality * w["quality"])
-        )
+        # Ponderación
+        df_cont = df_score * w["deepfake"]
+        cm_cont = color_match * w["color_match"]
+        re_cont = reflection * w["reflection"]
+        tx_cont = texture_lbp * w["texture"]
+        ps_cont = psd * w["psd"]
+        sy_cont = symmetry * w["symmetry"]
+        sr_cont = skin_resp * w["skin_response"]
+        qu_cont = quality * w["quality"]
         
-        is_live = final_score > 0.6
+        final_score = df_cont + cm_cont + re_cont + tx_cont + ps_cont + sy_cont + sr_cont + qu_cont
+        is_live = final_score >= thresh["live_score"]
         
         evidence = []
-        if df_score > 0.6: evidence.append("✓ DeepFake model pass")
+        if df_score > thresh["deepfake_alert"]: evidence.append("✓ DeepFake model pass")
         else: evidence.append("✗ DeepFake anomalies detected")
             
-        if color_match > 0.5: evidence.append("✓ Expected challenge color detected")
+        if color_match > thresh["color_match_min"]: evidence.append("✓ Expected challenge color detected")
         else: evidence.append("✗ Expected challenge color not matched")
             
-        if reflection > 0.1: evidence.append("✓ Natural reflection intensity")
+        if reflection > thresh["reflection_min"]: evidence.append("✓ Natural reflection intensity")
         else: evidence.append("✗ Low reflection strength (Possible Screen)")
             
-        if symmetry > 0.7: evidence.append("✓ Bilateral symmetry verified (Note: Beards/Shadows may affect this)")
+        if symmetry > thresh["symmetry_min"]: evidence.append("✓ Bilateral symmetry verified (Note: Beards/Shadows may affect this)")
         else: evidence.append("✗ Illumination asymmetric")
             
         elapsed = (time.perf_counter() - start) * 1000
+        
+        breakdown = {
+            "deepfake": {"raw": round(df_score, 4), "weight": w["deepfake"], "contribution": round(df_cont, 4)},
+            "color_match": {"raw": round(color_match, 4), "weight": w["color_match"], "contribution": round(cm_cont, 4)},
+            "reflection": {"raw": round(reflection, 4), "weight": w["reflection"], "contribution": round(re_cont, 4)},
+            "lbp": {"raw": round(texture_lbp, 4), "weight": w["texture"], "contribution": round(tx_cont, 4)},
+            "psd": {"raw": round(psd, 4), "weight": w["psd"], "contribution": round(ps_cont, 4)},
+            "symmetry": {"raw": round(symmetry, 4), "weight": w["symmetry"], "contribution": round(sy_cont, 4)},
+            "skin_response": {"raw": round(skin_resp, 4), "weight": w["skin_response"], "contribution": round(sr_cont, 4)},
+            "quality": {"raw": round(quality, 4), "weight": w["quality"], "contribution": round(qu_cont, 4)},
+            "final_score": round(final_score, 4)
+        }
         
         return {
             "is_live": is_live,
@@ -260,6 +274,7 @@ class WeightedDecisionEngine(DecisionEngine):
             "risk": "LOW" if is_live else "HIGH",
             "classification": "NONE" if is_live else "UNKNOWN",
             "evidence": evidence,
+            "decision_breakdown": breakdown,
             "time_ms": elapsed
         }
 
@@ -269,16 +284,16 @@ class WeightedDecisionEngine(DecisionEngine):
 class QualityModule:
     @staticmethod
     def check_quality(img):
+        div = ENGINE_CONFIG["heuristics"]
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blur = cv2.Laplacian(gray, cv2.CV_64F).var()
         brightness = np.mean(gray)
         
         issues = []
-        if blur < 50: issues.append("blur")
-        if brightness < 40: issues.append("underexposed")
-        if brightness > 230: issues.append("overexposed")
+        if blur < div["blur_threshold"]: issues.append("blur")
+        if brightness < div["brightness_min"]: issues.append("underexposed")
+        if brightness > div["brightness_max"]: issues.append("overexposed")
         
-        # Dinamizamos la contribución de la calidad en lugar de 1 o 0
         q_score = 1.0
         if "blur" in issues: q_score -= 0.5
         if "underexposed" in issues or "overexposed" in issues: q_score -= 0.3
