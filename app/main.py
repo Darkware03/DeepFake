@@ -249,6 +249,8 @@ async def detect(
             if challenge_result is not None:
                 content_resp["challenge"] = challenge_result
                 
+            from app.liveness_engine import numpy_to_python
+            
             # Agregamos Liveness Engine
             liveness_result = decide_liveness(max_score, challenge_result)
             content_resp["liveness"] = liveness_result
@@ -261,7 +263,7 @@ async def detect(
 
             return JSONResponse(
                 status_code=200,
-                content=content_resp
+                content=numpy_to_python(content_resp)
             )
             
         else:
@@ -293,6 +295,8 @@ async def detect(
             if challenge_result is not None:
                 content_resp_img["challenge"] = challenge_result
                 
+            from app.liveness_engine import numpy_to_python
+            
             # Agregamos Liveness Engine
             liveness_result = decide_liveness(prob, challenge_result)
             content_resp_img["liveness"] = liveness_result
@@ -305,7 +309,7 @@ async def detect(
 
             return JSONResponse(
                 status_code=200,
-                content=content_resp_img
+                content=numpy_to_python(content_resp_img)
             )
 
     except HTTPException:

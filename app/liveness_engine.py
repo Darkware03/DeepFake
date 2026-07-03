@@ -31,6 +31,19 @@ ENGINE_CONFIG = {
 # ==========================================
 # UTILS & ALGORITHMS
 # ==========================================
+def numpy_to_python(obj):
+    if isinstance(obj, np.ndarray):
+        return [numpy_to_python(item) for item in obj.tolist()]
+    elif isinstance(obj, np.generic):
+        return obj.item()
+    elif isinstance(obj, dict):
+        return {key: numpy_to_python(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [numpy_to_python(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(numpy_to_python(item) for item in obj)
+    return obj
+
 def hex_to_rgb(hex_color: str):
     hex_color = hex_color.lstrip('#')
     if len(hex_color) != 6:
@@ -334,7 +347,7 @@ class PADPipeline:
                         if k != "valid" and k != "time_ms" and isinstance(v, (int, float)):
                             flat_features[f"{region}_{k}"] = v
 
-        return {
+        res = {
             "valid": True,
             "features": flat_features,
             "score": 0.8,
@@ -344,6 +357,7 @@ class PADPipeline:
             "left_roi": {"normal_hsv": [0,0,0], "challenge_hsv": [0,0,0], "delta": [0,0,0]},
             "right_roi": {"normal_hsv": [0,0,0], "challenge_hsv": [0,0,0], "delta": [0,0,0]}
         }
+        return numpy_to_python(res)
 
 # ==========================================
 # EXPORTACIONES PARA main.py
@@ -364,10 +378,10 @@ def decide_liveness(deepfake_prob, challenge_data):
         result["analysis"] = result.get("evidence", [])
         result["recommendations"] = ["Manual review"] if result["risk"] != "LOW" else []
         
-        return result
+        return numpy_to_python(result)
     else:
         is_live = deepfake_prob <= 0.7
-        return {
+        res = {
             "is_live": is_live,
             "confidence": round(1.0 - deepfake_prob, 4),
             "attack_probability": round(deepfake_prob, 4),
@@ -380,3 +394,4 @@ def decide_liveness(deepfake_prob, challenge_data):
             "feature_schema_version": FEATURE_SCHEMA_VERSION,
             "decision_engine": pipeline.decision_engine.__class__.__name__
         }
+        return numpy_to_python(res)
