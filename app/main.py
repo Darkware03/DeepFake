@@ -134,101 +134,19 @@ async def health():
         "model_loaded": model is not None
     }
 
+from app.liveness_engine import analyze_reflection, decide_liveness
+
 # ==========================================================
 # LIGHT CHALLENGE VALIDATION
 # ==========================================================
-def validate_light_challenge(challenge_path: str, normal_path: str) -> dict:
+def validate_light_challenge(challenge_path: str, normal_path: str, expected_hex_color: str = "#FFFFFF") -> dict:
     normal_img = cv2.imread(normal_path)
     challenge_img = cv2.imread(challenge_path)
 
     if normal_img is None or challenge_img is None:
         return {"valid": False, "reason": "image_not_loaded"}
-
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    gray = cv2.cvtColor(normal_img, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-
-    if len(faces) == 0:
-        return {"valid": False, "reason": "face_not_found"}
-
-    x, y, w, h = faces[0]
-
-    # Reducir automáticamente 15% por cada lado
-    x_new = int(x + 0.15 * w)
-    y_new = int(y + 0.15 * h)
-    w_new = int(w * 0.70)
-    h_new = int(h * 0.70)
-
-    # Validar boundaries
-    if x_new < 0: x_new = 0
-    if y_new < 0: y_new = 0
-    if x_new + w_new > normal_img.shape[1]: w_new = normal_img.shape[1] - x_new
-    if y_new + h_new > normal_img.shape[0]: h_new = normal_img.shape[0] - y_new
-
-    w_half = w_new // 2
-
-    normal_hsv = cv2.cvtColor(normal_img, cv2.COLOR_BGR2HSV)
-    challenge_hsv = cv2.cvtColor(challenge_img, cv2.COLOR_BGR2HSV)
-
-    left_normal_roi = normal_hsv[y_new:y_new+h_new, x_new:x_new+w_half]
-    right_normal_roi = normal_hsv[y_new:y_new+h_new, x_new+w_half:x_new+w_new]
-
-    left_challenge_roi = challenge_hsv[y_new:y_new+h_new, x_new:x_new+w_half]
-    right_challenge_roi = challenge_hsv[y_new:y_new+h_new, x_new+w_half:x_new+w_new]
-
-    def get_mean(roi):
-        if roi.size > 0:
-            m = cv2.mean(roi)
-            return m[0], m[1], m[2]
-        return 0.0, 0.0, 0.0
-
-    m_nl_h, m_nl_s, m_nl_v = get_mean(left_normal_roi)
-    m_nr_h, m_nr_s, m_nr_v = get_mean(right_normal_roi)
-
-    m_cl_h, m_cl_s, m_cl_v = get_mean(left_challenge_roi)
-    m_cr_h, m_cr_s, m_cr_v = get_mean(right_challenge_roi)
-
-    dl_h = abs(m_cl_h - m_nl_h)
-    dl_s = abs(m_cl_s - m_nl_s)
-    dl_v = abs(m_cl_v - m_nl_v)
-
-    dr_h = abs(m_cr_h - m_nr_h)
-    dr_s = abs(m_cr_s - m_nr_s)
-    dr_v = abs(m_cr_v - m_nr_v)
-
-    score = min(((dl_h + dr_h) / 180.0 + (dl_s + dr_s) / 255.0 + (dl_v + dr_v) / 255.0) * 0.5, 1.0)
-
-    print("====================================================")
-    print("LIGHT CHALLENGE")
-    print("====================================================")
-    print("Face detected")
-    print(f"ROI Left HSV Normal: [{m_nl_h:.2f}, {m_nl_s:.2f}, {m_nl_v:.2f}]")
-    print(f"ROI Right HSV Normal: [{m_nr_h:.2f}, {m_nr_s:.2f}, {m_nr_v:.2f}]")
-    print(f"ROI Left HSV Challenge: [{m_cl_h:.2f}, {m_cl_s:.2f}, {m_cl_v:.2f}]")
-    print(f"ROI Right HSV Challenge: [{m_cr_h:.2f}, {m_cr_s:.2f}, {m_cr_v:.2f}]")
-    print(f"Delta Hue (L, R): {dl_h:.2f}, {dr_h:.2f}")
-    print(f"Delta Saturation (L, R): {dl_s:.2f}, {dr_s:.2f}")
-    print(f"Delta Value (L, R): {dl_v:.2f}, {dr_v:.2f}")
-    print(f"Challenge Score: {score:.2f}")
-    print("====================================================")
-
-    return {
-        "valid": True,
-        "score": round(score, 2),
-        "delta_hue": round((dl_h + dr_h)/2, 2),
-        "delta_saturation": round((dl_s + dr_s)/2, 2),
-        "delta_value": round((dl_v + dr_v)/2, 2),
-        "left_roi": {
-            "normal_hsv": [round(m_nl_h, 2), round(m_nl_s, 2), round(m_nl_v, 2)],
-            "challenge_hsv": [round(m_cl_h, 2), round(m_cl_s, 2), round(m_cl_v, 2)],
-            "delta": [round(dl_h, 2), round(dl_s, 2), round(dl_v, 2)]
-        },
-        "right_roi": {
-            "normal_hsv": [round(m_nr_h, 2), round(m_nr_s, 2), round(m_nr_v, 2)],
-            "challenge_hsv": [round(m_cr_h, 2), round(m_cr_s, 2), round(m_cr_v, 2)],
-            "delta": [round(dr_h, 2), round(dr_s, 2), round(dr_v, 2)]
-        }
-    }
+        
+    return analyze_reflection(normal_img, challenge_img, expected_hex_color)
 
 # ==========================================================
 # DETECT
@@ -239,7 +157,8 @@ async def detect(
     video: Optional[UploadFile] = File(None),
     challenge_image: Optional[UploadFile] = File(None),
     normal_image: Optional[UploadFile] = File(None),
-    challenge_id: Optional[str] = Form(None)
+    challenge_id: Optional[str] = Form(None),
+    challenge_color: Optional[str] = Form(None)
 ):
     if model is None:
         raise HTTPException(
@@ -269,8 +188,7 @@ async def detect(
             with open(nm_path, "wb") as buffer:
                 shutil.copyfileobj(normal_image.file, buffer)
             
-            challenge_result = validate_light_challenge(ch_path, nm_path)
-            #print(f"validate_light_challenge: {validate_light_challenge}")
+            challenge_result = validate_light_challenge(ch_path, nm_path, expected_hex_color=challenge_color or "#FFFFFF")
 
         ext = os.path.splitext(main_file.filename)[1].lower()
         VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv"}
@@ -330,6 +248,16 @@ async def detect(
             }
             if challenge_result is not None:
                 content_resp["challenge"] = challenge_result
+                
+            # Agregamos Liveness Engine
+            liveness_result = decide_liveness(max_score, challenge_result)
+            content_resp["liveness"] = liveness_result
+            
+            # Compatibilidad para los campos sueltos pedidos
+            content_resp["analysis"] = liveness_result.get("analysis", [])
+            content_resp["risk_level"] = liveness_result.get("risk", "LOW")
+            if "recommendations" in liveness_result:
+                content_resp["recommendations"] = liveness_result["recommendations"]
 
             return JSONResponse(
                 status_code=200,
@@ -364,6 +292,16 @@ async def detect(
             }
             if challenge_result is not None:
                 content_resp_img["challenge"] = challenge_result
+                
+            # Agregamos Liveness Engine
+            liveness_result = decide_liveness(prob, challenge_result)
+            content_resp_img["liveness"] = liveness_result
+            
+            # Compatibilidad para los campos sueltos pedidos
+            content_resp_img["analysis"] = liveness_result.get("analysis", [])
+            content_resp_img["risk_level"] = liveness_result.get("risk", "LOW")
+            if "recommendations" in liveness_result:
+                content_resp_img["recommendations"] = liveness_result["recommendations"]
 
             return JSONResponse(
                 status_code=200,

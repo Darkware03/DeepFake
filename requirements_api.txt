@@ -14,3 +14,5 @@ Prettytable==3.9.0
 face-alignment==1.4.1
 einops==0.7.0
 Pillow
+mediapipe
+scikit-image
