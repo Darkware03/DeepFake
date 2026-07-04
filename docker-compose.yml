@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: deepfake_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./dataset:/workspace/dataset
+      - ./app:/workspace/app
+    restart: always

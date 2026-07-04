@@ -1,9 +1,12 @@
+import os
 import cv2
 import numpy as np
 import mediapipe as mp
 import math
 import time
 from abc import ABC, abstractmethod
+import json
+import traceback
 
 # ==========================================
 # CONSTANTES Y VERSIONADO
@@ -13,21 +16,19 @@ FEATURE_SCHEMA_VERSION = "2.0.1"
 
 ENGINE_CONFIG = {
     "weights": {
-        # El peso de deepfake se traslada a la evidencia física (suma 1.0 total de features físicos)
-        # DeepFake será un modulador/penalizador sobre el physical score
-        "deepfake": 0.0, 
-        "color_match": 0.35, # Aumentado (era 0.25)
-        "reflection": 0.25,  # Aumentado (era 0.15)
-        "texture": 0.15,     # Aumentado (era 0.10)
-        "psd": 0.05,         # Reducido (era 0.10) - Menos robusto
-        "symmetry": 0.05,    
-        "skin_response": 0.10, # Aumentado (era 0.05)
+        "deepfake": 0.0,
+        "color_match": 0.35,
+        "reflection": 0.25,
+        "texture": 0.15,
+        "psd": 0.05,
+        "symmetry": 0.05,
+        "skin_response": 0.10,
         "quality": 0.05
     },
     "heuristics": {
-        "psd_normalization_divisor": 100.0, # Empírico (truncando a 1.0). Se mantiene.
-        "lbp_normalization_divisor": 255.0, # Justificado (rango LBP uint8 [0, 255]).
-        "reflection_normalization_divisor": 15.0, # Justificado (Delta L en CIE-LAB en luz controlada).
+        "psd_normalization_divisor": 100.0,
+        "lbp_normalization_divisor": 255.0,
+        "reflection_normalization_divisor": 15.0,
         "blur_threshold": 50.0,
         "brightness_min": 40.0,
         "brightness_max": 230.0
@@ -65,26 +66,21 @@ def hex_to_rgb(hex_color: str):
     return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
 def deltaE_76(lab1, lab2):
-    """
-    Distancia Euclideana en el espacio LAB (CIE76).
-    Nota: Esto NO es CIEDE2000. Es una métrica de distancia de color básica.
-    """
     L1, a1, b1 = lab1
     L2, a2, b2 = lab2
     return math.sqrt((L2 - L1)**2 + (a2 - a1)**2 + (b2 - b1)**2)
 
 from skimage.feature import local_binary_pattern
 
-def compute_lbp(gray, mask=None):
-    """
-    Implementación nativa optimizada de LBP utilizando scikit-image (C-backend).
-    Acelera el proceso original en ~13x conservando la estructura analítica.
-    """
+def compute_lbp(gray, mask=None, logger=None, name=""):
     if mask is not None:
         gray = cv2.bitwise_and(gray, gray, mask=mask)
         
-    # Radius = 1, Neighbors = 8, default method
     lbp = local_binary_pattern(gray, 8, 1, method='default')
+    
+    if logger is not None:
+        lbp_viz = np.uint8((lbp / lbp.max()) * 255)
+        logger.save_debug_image(f"lbp_{name}", lbp_viz)
     
     if mask is not None:
         valid_pixels = lbp[mask > 0]
@@ -96,26 +92,25 @@ def compute_lbp(gray, mask=None):
 # ==========================================
 class DecisionEngine(ABC):
     @abstractmethod
-    def decide(self, features, deepfake_prob):
+    def decide(self, features, deepfake_prob, logger=None):
         pass
 
 class Plugin(ABC):
     @abstractmethod
-    def process(self, img_n, img_c, mask_n, mask_c, expected_hex):
+    def process(self, img_n, img_c, mask_n, mask_c, expected_hex, logger=None, name=""):
         pass
 
 # ==========================================
 # PLUGINS REALES
 # ==========================================
 class TexturePlugin(Plugin):
-    def process(self, img_n, img_c, mask_n, mask_c, expected_hex):
+    def process(self, img_n, img_c, mask_n, mask_c, expected_hex, logger=None, name=""):
         start = time.perf_counter()
         if img_n is None or img_n.size == 0 or img_c is None or img_c.size == 0:
             return {"valid": False}
         
         gray_n = cv2.cvtColor(img_n, cv2.COLOR_BGR2GRAY)
         
-        # PSD
         f_n = np.fft.fft2(gray_n)
         fshift_n = np.fft.fftshift(f_n)
         mag_n = np.abs(fshift_n)
@@ -124,12 +119,14 @@ class TexturePlugin(Plugin):
         mag_n[cy-5:cy+5, cx-5:cx+5] = 0
         psd_n = np.sum(np.log(mag_n + 1)**2) / (h*w)
         
-        # LBP
-        lbp_n = compute_lbp(gray_n, mask_n)
+        if logger:
+            mag_viz = np.uint8(255 * (mag_n / (mag_n.max() + 1e-5)))
+            logger.save_debug_image(f"psd_mag_{name}", mag_viz)
+        
+        lbp_n = compute_lbp(gray_n, mask_n, logger, name)
         
         elapsed = (time.perf_counter() - start) * 1000
         
-        # Eliminadas métricas sin uso real (laplacian_var, fft_energy)
         return {
             "valid": True,
             "psd": float(psd_n),
@@ -138,7 +135,7 @@ class TexturePlugin(Plugin):
         }
 
 class ColorPlugin(Plugin):
-    def process(self, img_n, img_c, mask_n, mask_c, expected_hex):
+    def process(self, img_n, img_c, mask_n, mask_c, expected_hex, logger=None, name=""):
         start = time.perf_counter()
         if img_n is None or img_n.size == 0 or img_c is None or img_c.size == 0:
             return {"valid": False}
@@ -153,10 +150,12 @@ class ColorPlugin(Plugin):
         mean_lab_n = cv2.mean(lab_n, mask=mask_n)[:3]
         mean_lab_c = cv2.mean(lab_c, mask=mask_c)[:3]
         
+        if logger:
+            logger.save_debug_image(f"lab_n_{name}", lab_n)
+            logger.save_debug_image(f"lab_c_{name}", lab_c)
+        
         de76 = deltaE_76(mean_lab_n, mean_lab_c)
         
-        # Cosine Similarity para Color Match
-        # Vectores [R, G, B]
         v_exp = np.array([exp_r, exp_g, exp_b], dtype=np.float64)
         v_obs = np.array([
             mean_rgb_c[2] - mean_rgb_n[2],
@@ -173,7 +172,6 @@ class ColorPlugin(Plugin):
             cosine_sim = np.dot(v_exp, v_obs) / (norm_exp * norm_obs)
             color_match = max(0.0, float(cosine_sim))
             
-        # Reflection Strength (Basado en Delta L de LAB normalizado a 15 unidades como ideal)
         delta_l = abs(mean_lab_c[0] - mean_lab_n[0])
         reflection_str = min(1.0, float(delta_l) / ENGINE_CONFIG["heuristics"]["reflection_normalization_divisor"])
         
@@ -191,7 +189,7 @@ class ColorPlugin(Plugin):
 # MOTOR DE DECISIÓN PONDERADO (HEURÍSTICO)
 # ==========================================
 class WeightedDecisionEngine(DecisionEngine):
-    def decide(self, features, deepfake_prob):
+    def decide(self, features, deepfake_prob, logger=None):
         start = time.perf_counter()
         
         w = ENGINE_CONFIG["weights"]
@@ -200,8 +198,6 @@ class WeightedDecisionEngine(DecisionEngine):
         
         df_score = max(0.0, 1.0 - deepfake_prob)
         
-        # Uso de Mediana (estadística robusta) para descartar ROIs atípicos (outliers)
-        # en lugar de un promedio simple (mean) que se distorsiona con una sola ROI ocluida o sobresaturada.
         def avg_feat(name):
             vals = [v for k, v in features.items() if name in k and isinstance(v, (int, float))]
             return float(np.median(vals)) if vals else 0.0
@@ -218,8 +214,6 @@ class WeightedDecisionEngine(DecisionEngine):
         skin_resp = reflection * color_match
         quality = features.get("global_quality_score", 1.0)
         
-        # Ponderación
-        # df_cont ya no se suma linealmente. Xception actúa como señal de riesgo independiente.
         df_cont = 0.0
         cm_cont = color_match * w["color_match"]
         re_cont = reflection * w["reflection"]
@@ -231,9 +225,6 @@ class WeightedDecisionEngine(DecisionEngine):
         
         physical_score = cm_cont + re_cont + tx_cont + ps_cont + sy_cont + sr_cont + qu_cont
         
-        # Penalización DeepFake: Si el modelo está extremadamente seguro de un deepfake (> 0.7)
-        # castiga severamente la puntuación física, de lo contrario afecta levemente la confianza
-        # de forma proporcional.
         penalty = min(1.0, deepfake_prob) if deepfake_prob > thresh["deepfake_alert"] else (deepfake_prob * 0.5)
         final_score = max(0.0, physical_score * (1.0 - penalty))
         
@@ -263,8 +254,21 @@ class WeightedDecisionEngine(DecisionEngine):
             "symmetry": {"raw": round(symmetry, 4), "weight": w["symmetry"], "contribution": round(sy_cont, 4)},
             "skin_response": {"raw": round(skin_resp, 4), "weight": w["skin_response"], "contribution": round(sr_cont, 4)},
             "quality": {"raw": round(quality, 4), "weight": w["quality"], "contribution": round(qu_cont, 4)},
-            "final_score": round(final_score, 4)
+            "final_score": round(final_score, 4),
+            "weights": w,
+            "contributions": {
+                "color_match": round(cm_cont, 4),
+                "reflection": round(re_cont, 4),
+                "lbp": round(tx_cont, 4),
+                "psd": round(ps_cont, 4),
+                "symmetry": round(sy_cont, 4),
+                "skin_response": round(sr_cont, 4),
+                "quality": round(qu_cont, 4)
+            }
         }
+        
+        if logger:
+            logger.save_decision(breakdown)
         
         return {
             "is_live": is_live,
@@ -298,7 +302,7 @@ class QualityModule:
         if "blur" in issues: q_score -= 0.5
         if "underexposed" in issues or "overexposed" in issues: q_score -= 0.3
         
-        return len(issues) == 0, issues, max(0.0, q_score)
+        return len(issues) == 0, issues, max(0.0, q_score), blur, brightness
 
 # ==========================================
 # PIPELINE PRINCIPAL
@@ -308,6 +312,8 @@ class PADPipeline:
         self.decision_engine = WeightedDecisionEngine()
         self.mp_face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True)
         self.regions = ["forehead", "nose", "left_cheek", "right_cheek", "chin"]
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.mp_drawing_styles = mp.solutions.drawing_styles
         
     def _extract_rois(self, img, results):
         if not results.multi_face_landmarks: return {}
@@ -318,9 +324,7 @@ class PADPipeline:
             pts = np.array([(int(lms.landmark[i].x * w), int(lms.landmark[i].y * h)) for i in indices])
             if len(pts) == 0: return None, None
             
-            # Sanitizar bounding box
             x, y, bw, bh = cv2.boundingRect(pts)
-            
             x1 = max(0, x)
             y1 = max(0, y)
             x2 = min(w, x + bw)
@@ -332,7 +336,6 @@ class PADPipeline:
             roi = img[y1:y2, x1:x2]
             mask = np.zeros((roi.shape[0], roi.shape[1]), dtype=np.uint8)
             
-            # Ajustar coordenadas relativas a la ROI y limitar para evitar crash
             roi_pts = pts - [x1, y1]
             roi_pts = np.clip(roi_pts, [0, 0], [roi.shape[1]-1, roi.shape[0]-1])
             
@@ -348,12 +351,46 @@ class PADPipeline:
             "chin": get_bbox([152, 148, 176, 149, 150, 136, 172, 58, 132, 93])
         }
 
-    def analyze(self, normal_img, challenge_img, expected_hex_color):
-        ok_n, iss_n, q_n = QualityModule.check_quality(normal_img)
-        ok_c, iss_c, q_c = QualityModule.check_quality(challenge_img)
+    def analyze(self, normal_img, challenge_img, expected_hex_color, logger=None):
+        ok_n, iss_n, q_n, b_n, br_n = QualityModule.check_quality(normal_img)
+        ok_c, iss_c, q_c, b_c, br_c = QualityModule.check_quality(challenge_img)
         
         res_n = self.mp_face_mesh.process(cv2.cvtColor(normal_img, cv2.COLOR_BGR2RGB))
         res_c = self.mp_face_mesh.process(cv2.cvtColor(challenge_img, cv2.COLOR_BGR2RGB))
+        
+        if logger:
+            try:
+                meta_n = {
+                    "quality": q_n,
+                    "brightness": br_n,
+                    "blur": b_n,
+                    "issues": iss_n,
+                    "face_detected": bool(res_n.multi_face_landmarks),
+                    "landmarks_detected": bool(res_n.multi_face_landmarks)
+                }
+                meta_c = {
+                    "quality": q_c,
+                    "brightness": br_c,
+                    "blur": b_c,
+                    "issues": iss_c,
+                    "face_detected": bool(res_c.multi_face_landmarks),
+                    "landmarks_detected": bool(res_c.multi_face_landmarks)
+                }
+                logger.save_normal_image(normal_img, meta_n)
+                logger.save_challenge_image(challenge_img, meta_c)
+                
+                if res_n.multi_face_landmarks:
+                    annotated_image = normal_img.copy()
+                    for face_landmarks in res_n.multi_face_landmarks:
+                        self.mp_drawing.draw_landmarks(
+                            image=annotated_image,
+                            landmark_list=face_landmarks,
+                            connections=mp.solutions.face_mesh.FACEMESH_TESSELATION,
+                            landmark_drawing_spec=None,
+                            connection_drawing_spec=self.mp_drawing_styles.get_default_face_mesh_tesselation_style())
+                    logger.save_landmarks(1, annotated_image)
+            except Exception as e:
+                logger.log_error(e)
         
         if not res_n.multi_face_landmarks or not res_c.multi_face_landmarks:
             return {"valid": False, "reason": "face_not_found"}
@@ -370,8 +407,21 @@ class PADPipeline:
             r_img_n, r_mask_n = rois_n.get(region, (None, None))
             r_img_c, r_mask_c = rois_c.get(region, (None, None))
             
+            if logger and r_img_n is not None:
+                try:
+                    logger.save_roi(f"{region}_normal", r_img_n)
+                    logger.save_debug_image(f"mask_{region}_normal", r_mask_n)
+                except Exception as e:
+                    logger.log_error(e)
+            if logger and r_img_c is not None:
+                try:
+                    logger.save_roi(f"{region}_challenge", r_img_c)
+                    logger.save_debug_image(f"mask_{region}_challenge", r_mask_c)
+                except Exception as e:
+                    logger.log_error(e)
+            
             for p in plugins:
-                res = p.process(r_img_n, r_img_c, r_mask_n, r_mask_c, expected_hex_color)
+                res = p.process(r_img_n, r_img_c, r_mask_n, r_mask_c, expected_hex_color, logger, f"{region}")
                 if res.get("valid"):
                     for k, v in res.items():
                         if k != "valid" and k != "time_ms" and isinstance(v, (int, float)):
@@ -381,6 +431,24 @@ class PADPipeline:
             "valid": True,
             "features": flat_features
         }
+        
+        if logger:
+            try:
+                path_ch = os.path.join(logger.subdirs["capturas"], f"{logger.base_name}_challenge.json")
+                try:
+                    with open(path_ch, "r") as f:
+                        meta_c = json.load(f)
+                except:
+                    meta_c = {}
+                meta_c["features"] = flat_features
+                try:
+                    with open(path_ch, "w") as f:
+                        json.dump(meta_c, f, indent=4, default=str)
+                except:
+                    pass
+            except Exception as e:
+                logger.log_error(e)
+                
         return numpy_to_python(res)
 
 # ==========================================
@@ -388,13 +456,13 @@ class PADPipeline:
 # ==========================================
 pipeline = PADPipeline()
 
-def analyze_reflection(normal_img, challenge_img, expected_hex_color):
-    return pipeline.analyze(normal_img, challenge_img, expected_hex_color)
+def analyze_reflection(normal_img, challenge_img, expected_hex_color, logger=None):
+    return pipeline.analyze(normal_img, challenge_img, expected_hex_color, logger=logger)
 
-def decide_liveness(deepfake_prob, challenge_data):
+def decide_liveness(deepfake_prob, challenge_data, logger=None):
     if challenge_data and challenge_data.get("valid"):
         features = challenge_data.get("features", {})
-        result = pipeline.decision_engine.decide(features, deepfake_prob)
+        result = pipeline.decision_engine.decide(features, deepfake_prob, logger=logger)
         
         result["engine_version"] = ENGINE_VERSION
         result["feature_schema_version"] = FEATURE_SCHEMA_VERSION
@@ -418,4 +486,6 @@ def decide_liveness(deepfake_prob, challenge_data):
             "feature_schema_version": FEATURE_SCHEMA_VERSION,
             "decision_engine": pipeline.decision_engine.__class__.__name__
         }
+        if logger:
+            logger.save_decision(res)
         return numpy_to_python(res)

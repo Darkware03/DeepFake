@@ -135,18 +135,19 @@ async def health():
     }
 
 from app.liveness_engine import analyze_reflection, decide_liveness
+from app.dataset_logger import DatasetLogger
 
 # ==========================================================
 # LIGHT CHALLENGE VALIDATION
 # ==========================================================
-def validate_light_challenge(challenge_path: str, normal_path: str, expected_hex_color: str = "#FFFFFF") -> dict:
+def validate_light_challenge(challenge_path: str, normal_path: str, expected_hex_color: str = "#FFFFFF", logger=None) -> dict:
     normal_img = cv2.imread(normal_path)
     challenge_img = cv2.imread(challenge_path)
 
     if normal_img is None or challenge_img is None:
         return {"valid": False, "reason": "image_not_loaded"}
-        
-    return analyze_reflection(normal_img, challenge_img, expected_hex_color)
+
+    return analyze_reflection(normal_img, challenge_img, expected_hex_color, logger=logger)
 
 # ==========================================================
 # DETECT
@@ -173,7 +174,9 @@ async def detect(
     import tempfile
     import re
     from pathlib import Path
-    
+    import time
+    from datetime import datetime
+
     # Validar challenge_color si fue proveído
     valid_color = "#FFFFFF"
     if challenge_color is not None:
@@ -182,6 +185,8 @@ async def detect(
         valid_color = challenge_color
 
     challenge_result = None
+    logger = DatasetLogger()
+    start_time = time.time()
 
     try:
         with tempfile.TemporaryDirectory(dir="/tmp", prefix="analisis_") as temp_dir:
@@ -190,6 +195,11 @@ async def detect(
             temp_file = os.path.join(temp_dir, safe_filename)
             with open(temp_file, "wb") as buffer:
                 shutil.copyfileobj(main_file.file, buffer)
+                
+            try:
+                logger.save_video(temp_file)
+            except Exception as e:
+                logger.log_error(e)
 
             if challenge_image and normal_image:
                 ch_safe = Path(challenge_image.filename).name
@@ -200,59 +210,97 @@ async def detect(
                     shutil.copyfileobj(challenge_image.file, buffer)
                 with open(nm_path, "wb") as buffer:
                     shutil.copyfileobj(normal_image.file, buffer)
-                
-                challenge_result = validate_light_challenge(ch_path, nm_path, expected_hex_color=valid_color)
+                    
+                try:
+                    logger.save_normal_image(nm_path)
+                    logger.save_challenge_image(ch_path)
+                except Exception as e:
+                    logger.log_error(e)
+
+                challenge_result = validate_light_challenge(ch_path, nm_path, expected_hex_color=valid_color, logger=logger)
 
             ext = os.path.splitext(safe_filename)[1].lower()
             VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv"}
-            
+
             scores = []
-            
+
             if ext in VIDEO_EXTENSIONS:
                 cap = cv2.VideoCapture(temp_file)
                 if not cap.isOpened():
                     raise HTTPException(status_code=400, detail="Video inválido")
-                
+
                 fps = cap.get(cv2.CAP_PROP_FPS)
                 if fps == 0 or np.isnan(fps):
                     fps = 30.0
-                
+
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                duration = total_frames / fps if fps > 0 else 0
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                file_size = os.path.getsize(temp_file)
+
                 frame_interval = max(int(fps / 2), 1)
                 frame_count = 0
-                
+                timeline = {}
+                csv_rows = []
+
                 while True:
                     ret, frame = cap.read()
                     if not ret:
                         break
                         
+                    logger.save_original_frame(frame_count, frame)
+
                     if frame_count % frame_interval == 0:
                         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
                         img_resized = cv2.resize(img_rgb, (256, 256), interpolation=cv2.INTER_CUBIC)
                         from PIL import Image
                         img_pil = Image.fromarray(img_resized)
                         img_tensor = preprocess_transform(img_pil).unsqueeze(0).to(DEVICE)
-                        
+
                         with torch.no_grad():
                             out, _ = model(img_tensor)
                             prob = float(torch.softmax(out, dim=1)[:, 1].item())
                         scores.append(prob)
-                    
+                        
+                        ts_frame = datetime.now().isoformat()
+                        timeline[f"frame_{frame_count:06d}"] = prob
+                        csv_rows.append({
+                            "frame": frame_count,
+                            "timestamp": ts_frame,
+                            "deepfake_probability": round(prob, 4),
+                            "classification": "FAKE" if prob >= 0.70 else "REAL"
+                        })
+                        
+                        frame_meta = {
+                            "frame": frame_count,
+                            "timestamp": ts_frame,
+                            "score": prob,
+                            "probabilidad": round(prob, 4),
+                            "modelo": "Xception",
+                            "clasificación": "FAKE" if prob >= 0.70 else "REAL",
+                            "preprocesamiento": "Resize 256x256, RGB, Normalize(-0.5, 0.5)",
+                            "resolución": f"{frame.shape[1]}x{frame.shape[0]}"
+                        }
+                        logger.save_analyzed_frame(frame_count, frame, frame_meta)
+
                     frame_count += 1
-                    
+
                 cap.release()
-                
+
                 if len(scores) == 0:
                     raise HTTPException(status_code=400, detail="No se pudieron extraer frames")
-                    
+
                 average_score = float(np.mean(scores))
                 max_score = float(np.max(scores))
                 p95_score = float(np.percentile(scores, 95))
-                
+
                 print(f"Frames analizados: {len(scores)}")
                 print(f"Average score: {average_score}")
                 print(f"Max score: {max_score}")
                 print(f"P95 score: {p95_score}")
-                
+
                 content_resp = {
                     "filename": safe_filename,
                     "frames_analyzed": len(scores),
@@ -266,34 +314,91 @@ async def detect(
                 }
                 if challenge_result is not None:
                     content_resp["challenge"] = challenge_result
-                    
+
                 from app.liveness_engine import numpy_to_python
-                
+
                 # Agregamos Liveness Engine usando max_score como dicta la compatibilidad
-                liveness_result = decide_liveness(max_score, challenge_result)
+                liveness_result = decide_liveness(max_score, challenge_result, logger=logger)
                 content_resp["liveness"] = liveness_result
-                
+
                 # Compatibilidad para los campos sueltos pedidos
                 content_resp["analysis"] = liveness_result.get("analysis", [])
                 content_resp["risk_level"] = liveness_result.get("risk", "LOW")
                 if "recommendations" in liveness_result:
                     content_resp["recommendations"] = liveness_result["recommendations"]
+                    
+                process_time = time.time() - start_time
+                try:
+                    video_metadata = {
+                        "nombre archivo": safe_filename,
+                        "timestamp": datetime.now().isoformat(),
+                        "hash sha256": logger.hashes.get("video", ""),
+                        "fps": fps,
+                        "duración": duration,
+                        "resolución": f"{width}x{height}",
+                        "tamaño": file_size,
+                        "frames totales": total_frames,
+                        "frames analizados": len(scores),
+                        "average_probability": round(average_score, 4),
+                        "max_probability": round(max_score, 4),
+                        "p95_probability": round(p95_score, 4),
+                        "deepfake_probability": round(max_score, 4),
+                        "is_manipulated": max_score >= 0.70,
+                        "tiempo total de procesamiento": process_time,
+                        "modelo utilizado": "Xception",
+                        "pesos utilizados": PATH_PESOS,
+                        "device CPU/GPU": str(DEVICE)
+                    }
+                    
+                    logger.save_video_metadata(video_metadata)
+                    logger.save_timeline(timeline)
+                    logger.save_scores_csv(csv_rows)
+                    
+                    import mediapipe as mp
+                    meta = {
+                        "engine_version": "2.1.1",
+                        "feature_schema_version": "2.0.1",
+                        "opencv_version": cv2.__version__,
+                        "mediapipe_version": mp.__version__,
+                        "python_version": sys.version,
+                        "modelo": "Xception",
+                        "checkpoint": PATH_PESOS,
+                        "device": str(DEVICE)
+                    }
+                    logger.save_metadata(meta)
+                    logger.save_response(numpy_to_python(content_resp))
+                    logger.save_checksums()
+                except Exception as e:
+                    logger.log_error(e)
 
                 return JSONResponse(
                     status_code=200,
                     content=numpy_to_python(content_resp)
                 )
-                
+
             else:
                 # 1. Leer imagen con OpenCV
                 img = cv2.imread(temp_file)
                 if img is None:
                     raise HTTPException(status_code=400, detail=f"No se pudo leer la imagen: {safe_filename}")
 
+                logger.save_original_frame(0, img)
+
                 # 2. Transformaciones DeepFakeBench (abstract_dataset.py)
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 img_resized = cv2.resize(img_rgb, (256, 256), interpolation=cv2.INTER_CUBIC)
                 
+                frame_meta = {
+                    "frame": 0,
+                    "timestamp": datetime.now().isoformat(),
+                    "score": 0.0,
+                    "probabilidad": 0.0,
+                    "modelo": "Xception",
+                    "clasificación": "UNKNOWN",
+                    "preprocesamiento": "Resize 256x256, RGB, Normalize(-0.5, 0.5)",
+                    "resolución": f"{img.shape[1]}x{img.shape[0]}"
+                }
+
                 # Convertir a PIL
                 from PIL import Image
                 img_pil = Image.fromarray(img_resized)
@@ -303,6 +408,19 @@ async def detect(
                 with torch.no_grad():
                     out, _ = model(img_tensor)
                     prob = float(torch.softmax(out, dim=1)[:, 1].item())
+                    
+                frame_meta["score"] = prob
+                frame_meta["probabilidad"] = round(prob, 4)
+                frame_meta["clasificación"] = "FAKE" if prob >= 0.70 else "REAL"
+                logger.save_analyzed_frame(0, img, frame_meta)
+                
+                logger.save_timeline({"frame_000000": prob})
+                logger.save_scores_csv([{
+                    "frame": 0,
+                    "timestamp": datetime.now().isoformat(),
+                    "deepfake_probability": round(prob, 4),
+                    "classification": "FAKE" if prob >= 0.70 else "REAL"
+                }])
 
                 content_resp_img = {
                     "filename": safe_filename,
@@ -312,18 +430,60 @@ async def detect(
                 }
                 if challenge_result is not None:
                     content_resp_img["challenge"] = challenge_result
-                    
+
                 from app.liveness_engine import numpy_to_python
-                
+
                 # Agregamos Liveness Engine
-                liveness_result = decide_liveness(prob, challenge_result)
+                liveness_result = decide_liveness(prob, challenge_result, logger=logger)
                 content_resp_img["liveness"] = liveness_result
-                
+
                 # Compatibilidad para los campos sueltos pedidos
                 content_resp_img["analysis"] = liveness_result.get("analysis", [])
                 content_resp_img["risk_level"] = liveness_result.get("risk", "LOW")
                 if "recommendations" in liveness_result:
                     content_resp_img["recommendations"] = liveness_result["recommendations"]
+                    
+                process_time = time.time() - start_time
+                try:
+                    video_metadata = {
+                        "nombre archivo": safe_filename,
+                        "timestamp": datetime.now().isoformat(),
+                        "hash sha256": logger.hashes.get("video", ""),
+                        "fps": 0,
+                        "duración": 0,
+                        "resolución": f"{img.shape[1]}x{img.shape[0]}",
+                        "tamaño": os.path.getsize(temp_file),
+                        "frames totales": 1,
+                        "frames analizados": 1,
+                        "average_probability": round(prob, 4),
+                        "max_probability": round(prob, 4),
+                        "p95_probability": round(prob, 4),
+                        "deepfake_probability": round(prob, 4),
+                        "is_manipulated": prob >= 0.70,
+                        "tiempo total de procesamiento": process_time,
+                        "modelo utilizado": "Xception",
+                        "pesos utilizados": PATH_PESOS,
+                        "device CPU/GPU": str(DEVICE)
+                    }
+                    
+                    logger.save_video_metadata(video_metadata)
+                    
+                    import mediapipe as mp
+                    meta = {
+                        "engine_version": "2.1.1",
+                        "feature_schema_version": "2.0.1",
+                        "opencv_version": cv2.__version__,
+                        "mediapipe_version": mp.__version__,
+                        "python_version": sys.version,
+                        "modelo": "Xception",
+                        "checkpoint": PATH_PESOS,
+                        "device": str(DEVICE)
+                    }
+                    logger.save_metadata(meta)
+                    logger.save_response(numpy_to_python(content_resp_img))
+                    logger.save_checksums()
+                except Exception as e:
+                    logger.log_error(e)
 
                 return JSONResponse(
                     status_code=200,
@@ -333,6 +493,8 @@ async def detect(
     except HTTPException:
         raise
     except Exception as e:
+        if logger:
+            logger.log_error(e)
         raise HTTPException(
             status_code=500,
             detail=str(e)
