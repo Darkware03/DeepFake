@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 import time
+import sys
 import shutil
 import hashlib
 import traceback
@@ -45,7 +46,8 @@ class DatasetLogger:
         
         base_name = f"{timestamp}_{micro}"
         
-        self.dataset_root = os.path.join(os.getcwd(), "dataset")
+        # Permite configurar la ruta raíz mediante variable de entorno (útil para GCP, AWS, etc.)
+        self.dataset_root = os.getenv("DATASET_ROOT_PATH", os.path.join(os.getcwd(), "dataset"))
         type_folder = self.type_folders.get(self.dataset_type, "07_desconocidos")
         
         proposed_path = os.path.join(self.dataset_root, type_folder, base_name)
@@ -79,8 +81,8 @@ class DatasetLogger:
         try:
             for path in self.subdirs.values():
                 os.makedirs(path, exist_ok=True)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[DatasetLogger Error] No se pudieron crear los directorios: {e}", file=sys.stderr)
 
     def _safe_execute(self, func, *args, **kwargs):
         try:
