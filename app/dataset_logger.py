@@ -23,7 +23,7 @@ import numpy as np
 # 8 = Casos rechazados manualmente
 #
 # ==========================================================
-DATASET_TYPE = 3
+DATASET_TYPE = 1
 
 class DatasetLogger:
     def __init__(self, dataset_type=DATASET_TYPE):
