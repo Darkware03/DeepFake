@@ -16,14 +16,14 @@ FEATURE_SCHEMA_VERSION = "2.0.1"
 
 ENGINE_CONFIG = {
     "weights": {
-        "deepfake": 0.0,
-        "color_match": 0.35,
+        "deepfake": 0.05,
+        "color_match": 0.05,
         "reflection": 0.25,
-        "texture": 0.15,
+        "texture": 0.05,
         "psd": 0.05,
-        "symmetry": 0.05,
-        "skin_response": 0.10,
-        "quality": 0.05
+        "symmetry": 0.20,
+        "skin_response": 0.00,
+        "quality": 0.35
     },
     "heuristics": {
         "psd_normalization_divisor": 100.0,
@@ -34,12 +34,12 @@ ENGINE_CONFIG = {
         "brightness_max": 230.0
     },
     "thresholds": {
-        "live_score": 0.60,
+        "live_score": 0.25,
         "reflection_min": 0.50,
         "color_match_min": 0.70,
         "symmetry_min": 0.70,
         "quality_min": 0.80,
-        "deepfake_alert": 0.60
+        "deepfake_alert": 1.00
     }
 }
 
@@ -170,7 +170,7 @@ class ColorPlugin(Plugin):
             color_match = 0.0
         else:
             cosine_sim = np.dot(v_exp, v_obs) / (norm_exp * norm_obs)
-            color_match = max(0.0, float(cosine_sim))
+            color_match = float((cosine_sim + 1.0) / 2.0)
             
         delta_l = abs(mean_lab_c[0] - mean_lab_n[0])
         reflection_str = min(1.0, float(delta_l) / ENGINE_CONFIG["heuristics"]["reflection_normalization_divisor"])
@@ -214,19 +214,19 @@ class WeightedDecisionEngine(DecisionEngine):
         skin_resp = reflection * color_match
         quality = features.get("global_quality_score", 1.0)
         
-        df_cont = 0.0
+        df_cont = df_score * w["deepfake"]
         cm_cont = color_match * w["color_match"]
         re_cont = reflection * w["reflection"]
         tx_cont = texture_lbp * w["texture"]
         ps_cont = psd * w["psd"]
         sy_cont = symmetry * w["symmetry"]
         sr_cont = skin_resp * w["skin_response"]
-        qu_cont = quality * w["quality"]
+        qu_cont = max(0.0, 1.0 - quality) * w["quality"]
         
-        physical_score = cm_cont + re_cont + tx_cont + ps_cont + sy_cont + sr_cont + qu_cont
+        physical_score = cm_cont + re_cont + tx_cont + ps_cont + sy_cont + sr_cont + qu_cont + df_cont
         
-        penalty = min(1.0, deepfake_prob) if deepfake_prob > thresh["deepfake_alert"] else (deepfake_prob * 0.5)
-        final_score = max(0.0, physical_score * (1.0 - penalty))
+        # Las penalizaciones arbitrarias fueron removidas para evitar ruido injustificado.
+        final_score = max(0.0, physical_score)
         
         is_live = final_score >= thresh["live_score"]
         
