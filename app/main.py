@@ -152,6 +152,101 @@ def validate_light_challenge(challenge_path: str, normal_path: str, expected_hex
 # ==========================================================
 # DETECT
 # ==========================================================
+@app.post("/api/v1/detect_colors", summary="Valida múltiples colores para Liveness (Pigmentación)", description="Recibe una imagen normal y 'n' imágenes de desafío con sus 'n' colores respectivos para validar la pigmentación y el reflejo en la piel.")
+async def detect_colors(
+    normal_image: UploadFile = File(..., description="Imagen en condiciones normales sin flash"),
+    challenge_images: list[UploadFile] = File(..., description="Lista de n imágenes con el flash activo"),
+    challenge_colors: list[str] = Form(..., description="Lista de n colores hexadecimales correspondientes a cada imagen de desafío")
+):
+    import tempfile
+    import os
+    import shutil
+    from pathlib import Path
+
+    # Si viene como un solo string separado por comas
+    if len(challenge_colors) == 1 and "," in challenge_colors[0]:
+        challenge_colors = [c.strip() for c in challenge_colors[0].split(",")]
+
+    if len(challenge_images) != len(challenge_colors):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"El número de challenge_images ({len(challenge_images)}) debe coincidir con el número de challenge_colors ({len(challenge_colors)})"
+        )
+
+    resultados_resumidos = []
+    logger = DatasetLogger()
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="analisis_multi_") as temp_dir:
+        nm_safe = Path(normal_image.filename).name
+        nm_path = os.path.join(temp_dir, "normal_" + nm_safe)
+        
+        with open(nm_path, "wb") as buffer:
+            shutil.copyfileobj(normal_image.file, buffer)
+            
+        try:
+            logger.save_normal_image(nm_path)
+        except Exception as e:
+            logger.log_error(e)
+
+        # Evaluar la probabilidad de deepfake en la imagen normal
+        deepfake_prob = 0.0
+        img_n = cv2.imread(nm_path)
+        if img_n is not None and model is not None:
+            try:
+                img_rgb = cv2.cvtColor(img_n, cv2.COLOR_BGR2RGB)
+                img_resized = cv2.resize(img_rgb, (256, 256), interpolation=cv2.INTER_CUBIC)
+                from PIL import Image
+                img_pil = Image.fromarray(img_resized)
+                img_tensor = preprocess_transform(img_pil).unsqueeze(0).to(DEVICE)
+
+                with torch.no_grad():
+                    out, _ = model(img_tensor)
+                    deepfake_prob = float(torch.softmax(out, dim=1)[:, 1].item())
+            except Exception as e:
+                print(f"Error evaluando deepfake en detect_colors: {e}")
+
+        for idx, (ch_img, ch_color) in enumerate(zip(challenge_images, challenge_colors)):
+            ch_safe = Path(ch_img.filename).name
+            ch_path = os.path.join(temp_dir, f"challenge_{idx}_{ch_safe}")
+            
+            with open(ch_path, "wb") as buffer:
+                shutil.copyfileobj(ch_img.file, buffer)
+                
+            try:
+                logger.save_challenge_image(ch_path)
+            except Exception as e:
+                pass
+
+            resultado = validate_light_challenge(ch_path, nm_path, expected_hex_color=ch_color, logger=logger)
+            
+            # Usamos la probabilidad de deepfake calculada para que el endpoint sea seguro
+            resultado_liveness = decide_liveness(deepfake_prob, resultado, logger=logger)
+            
+            # Construir el objeto resumido para la respuesta
+            color_match = 0.0
+            reflection = 0.0
+            
+            breakdown = resultado_liveness.get("decision_breakdown", {})
+            color_match = breakdown.get("color_match", {}).get("raw", 0.0)
+            reflection = breakdown.get("reflection", {}).get("raw", 0.0)
+
+            # Para la API devolvemos valores simplificados
+            res_item = {
+                "color": ch_color,
+                "is_valid": resultado_liveness.get("is_live", False),
+                "pigmentation_match": round(color_match, 4),
+                "reflection_strength": round(reflection, 4),
+                "risk_level": resultado_liveness.get("risk", "UNKNOWN")
+            }
+            
+            # Si el motor falló en procesar la imagen, incluir la razón para debug
+            if not resultado.get("valid", False):
+                res_item["error"] = resultado.get("reason", "unknown_error")
+
+            resultados_resumidos.append(res_item)
+
+    return {"resultados": resultados_resumidos}
+
 @app.post("/api/v1/detect")
 async def detect(
     file: Optional[UploadFile] = File(None),

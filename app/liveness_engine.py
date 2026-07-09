@@ -225,9 +225,16 @@ class WeightedDecisionEngine(DecisionEngine):
         
         physical_score = cm_cont + re_cont + tx_cont + ps_cont + sy_cont + sr_cont + qu_cont + df_cont
         
-        # Las penalizaciones arbitrarias fueron removidas para evitar ruido injustificado.
         final_score = max(0.0, physical_score)
         
+        # Penalizaciones estrictas: El AWB (Auto White Balance) de las cámaras reales arruina el color_match,
+        # pero el reflejo de luz (reflection) siempre debe existir si el flash es real.
+        # Los videos de IA no tienen reflejo de luz real (típicamente < 0.16 por ruido).
+        # Las fotos reales con flash tienen reflejo >= 0.25 incluso con AWB fuerte.
+        if reflection < 0.20:
+            final_score -= 0.50  # Penalización fuerte para descartar rostros generados o sin iluminación
+            final_score = max(0.0, final_score)
+            
         is_live = final_score >= thresh["live_score"]
         
         evidence = []
